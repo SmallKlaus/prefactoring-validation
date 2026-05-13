@@ -193,15 +193,22 @@ def model_label(model: str) -> str:
     return pricing["label"] if pricing else model
 
 
-def estimate_tokens_heuristic(text: str) -> int:
+def estimate_tokens_heuristic(client: anthropic.Anthropic, model: str, text: str) -> int:
     """
-    Cheap local token estimate for dry runs.
-
-    Anthropic billing uses model-specific tokenization, so this is intentionally
-    labeled as an estimate. For mixed prose + code diff prompts, 4 chars/token is
-    a practical planning heuristic.
+    Count tokens using Anthropic's token counting API (no billing cost).
+    
+    Uses client.messages.count_tokens() for accurate per-model token measurement.
     """
-    return max(1, math.ceil(len(text) / 4))
+    try:
+        response = client.messages.count_tokens(
+            model=model,
+            messages=[{"role": "user", "content": text}],
+        )
+        return object_get(response, "input_tokens", 1)
+    except Exception as e:
+        log.warning("Token counting failed: %s. Falling back to heuristic.", e)
+        # Fallback to 4 chars/token heuristic if API call fails
+        return max(1, math.ceil(len(text) / 4))
 
 
 def estimate_cost_usd(
@@ -959,8 +966,17 @@ def run_dry_run(
     sample_size: int = 5,
     assumed_output_tokens: int = MAX_CLAUDE_OUTPUT_TOKENS,
     estimate_diffs: bool = True,
+    anthropic_key: Optional[str] = None,
 ) -> None:
     log.info("DRY RUN - counting eligible issues and estimating Anthropic cost.")
+    
+    if not anthropic_key:
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        log.error("ANTHROPIC_API_KEY not set. Cannot estimate tokens.")
+        sys.exit(1)
+    
+    client = anthropic.Anthropic(api_key=anthropic_key)
 
     all_issues = load_json(issues_file)
     issue_items = list(all_issues.items())
@@ -1024,7 +1040,7 @@ def run_dry_run(
                     samples_with_diff += 1
 
         prompt = build_prompt_for_issue(issue, report, diff_data)
-        sample_input_tokens.append(estimate_tokens_heuristic(prompt))
+        sample_input_tokens.append(estimate_tokens_heuristic(client, model, prompt))
 
     avg_input = math.ceil(sum(sample_input_tokens) / len(sample_input_tokens))
     min_input = min(sample_input_tokens)
@@ -1168,6 +1184,7 @@ Environment variables:
             sample_size=args.dry_run_sample_size,
             assumed_output_tokens=args.dry_run_output_tokens,
             estimate_diffs=not args.no_dry_run_diffs,
+            anthropic_key=anthropic_key,
         )
         return
 
