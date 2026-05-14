@@ -1,0 +1,33 @@
+{
+  "batch_id": "msgbatch_01EPcL6yW1hE9NB1UsiNegmG",
+  "model": "claude-sonnet-4-6",
+  "output_file": "motivational_analysis\\yarn\\yarn_prefactoring_verification.jsonl",
+  "custom_id_to_jira_id": {
+    "YARN-9124": "YARN-9124",
+    "YARN-9676": "YARN-9676",
+    "YARN-9679": "YARN-9679",
+    "YARN-9966": "YARN-9966",
+    "YARN-10399": "YARN-10399",
+    "YARN-10737": "YARN-10737",
+    "YARN-11116": "YARN-11116",
+    "YARN-11172": "YARN-11172",
+    "YARN-11029": "YARN-11029",
+    "YARN-11196": "YARN-11196",
+    "YARN-11255": "YARN-11255",
+    "YARN-11328": "YARN-11328",
+    "YARN-11360": "YARN-11360",
+    "YARN-11465": "YARN-11465",
+    "YARN-11630": "YARN-11630",
+    "YARN-11663": "YARN-11663",
+    "YARN-11703": "YARN-11703",
+    "YARN-11738": "YARN-11738",
+    "YARN-11760": "YARN-11760",
+    "YARN-11762": "YARN-11762",
+    "YARN-11795": "YARN-11795",
+    "YARN-11798": "YARN-11798",
+    "YARN-11805": "YARN-11805",
+    "YARN-11807": "YARN-11807",
+    "YARN-11898": "YARN-11898"
+  },
+  "created_at_unix": 1778787174
+}

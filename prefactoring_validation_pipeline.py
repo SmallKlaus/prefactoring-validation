@@ -29,8 +29,13 @@ Usage:
 
 Requirements:
   pip install anthropic requests
-"""
 
+Order commands : 
+1. Submit to the API and poll the API :   
+    python prefactoring_validation_pipeline.py --project hadoop-mapreduce --issues "D:\TD_PRIO_WORK\FULL_IMPLEMENTATION\CDBRT_RF_GNN\issues_with_refactoring\mapreduce_issues_after_5.json" --reports-dir "D:\TD_PRIO_WORK\EXPERIMENTAL\TD_Dataset\DATA\SONAR_REPORTS\MAPREDUCE\ALL_REPORTS" --output "./motivational_analysis/mapreduce/mapreduce_prefactoring_verification.jsonl" --model "sonnet-4.6" --api-mode batch --batch-wait --batch-poll-interval 120   
+2. Analyze results for a csv file to visualize : 
+    python analyze_results.py --results "./motivational_analysis/flink/flink_prefactoring_verification.jsonl" --output-csv "./motivational_analysis/flink/flink_summary.csv"
+"""
 import argparse
 import json
 import math
@@ -107,8 +112,17 @@ MAX_DESCRIPTION_CHARS   = 700   # Truncate long JIRA descriptions
 MAX_FIXED_ISSUES_SHOWN  = 20    # Max fixed issues to include in prompt
 CACHE_DIR               = Path(".diff_cache")
 SLEEP_BETWEEN_CALLS     = 0.4   # Seconds between Claude API calls
-MAX_CLAUDE_OUTPUT_TOKENS = 600
+MAX_CLAUDE_OUTPUT_TOKENS = 800  # Raised from 600: gives the model room to output the full JSON object
 DEFAULT_MODEL           = "claude-sonnet-4-20250514"
+
+# System prompt enforces JSON-only output at the API level, independent of user-turn instructions.
+# The system prompt is the primary enforcement mechanism for JSON-only output.
+SYSTEM_PROMPT = (
+    "You are a software engineering research API that returns structured JSON verdicts. "
+    "Your response MUST be a single valid JSON object and nothing else — "
+    "no prose, no markdown fences, no explanations outside the JSON. "
+    "Your entire response must be directly parseable by json.loads()."
+)
 
 # Pricing source: https://platform.claude.com/docs/en/about-claude/pricing
 # Last checked: 2026-05-13. Prices are USD per million tokens.
@@ -181,6 +195,26 @@ log = logging.getLogger(__name__)
 def load_json(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+
+def diagnose_environment():
+    """Check and report environment variable availability."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    
+    log.info("Environment diagnostics:")
+    log.info("  ANTHROPIC_API_KEY: %s", "SET" if api_key.strip() else "NOT SET (empty or whitespace)")
+    if api_key.strip():
+        log.info("    → Key preview: %s...%s", api_key[:10], api_key[-5:])
+    log.info("  GITHUB_TOKEN:      %s", "SET" if github_token.strip() else "NOT SET (empty or whitespace)")
+    
+    if not api_key.strip():
+        log.info("\nTo set ANTHROPIC_API_KEY:")
+        log.info("  PowerShell:    $env:ANTHROPIC_API_KEY='sk-ant-...'")
+        log.info("  CMD:           set ANTHROPIC_API_KEY=sk-ant-...")
+        log.info("  Bash/Linux:    export ANTHROPIC_API_KEY='sk-ant-...'")
+        log.info("  After setting, restart your terminal/IDE for changes to take effect.")
 
 
 def normalize_model(model: str) -> str:
@@ -271,6 +305,13 @@ def is_production_java(filename: str) -> bool:
         and "ITCase.java" not in f
         and "Spec.java" not in f
     )
+
+
+def is_java(filename: str) -> bool:
+    """True for any .java file (includes tests)."""
+    if not filename:
+        return False
+    return filename.replace("\\", "/").endswith(".java")
 
 
 def classify_rule(rule: str) -> str:
@@ -396,12 +437,24 @@ def build_prompt(issue: dict, report: dict, diff_files: list) -> str:
     diff_section = "\n\n".join(diff_section_parts) if diff_section_parts else "(no production diffs available)"
 
     # ---- Assemble ----
-    return f"""You are a software engineering researcher. Determine if **prefactoring** occurred.
+    return f"""You are a software engineering researcher studying technical debt co-removal patterns.
 
-PREFACTORING DEFINITION: Refactoring performed specifically to prepare the codebase
-for a new feature — not general TD cleanup. Signals: structural refactorings (Extract
-Method, Move Class, Pull Up) that simplify the exact files the feature touches, and/or
-structural SonarQube fixes (Cognitive Complexity, Coupling) in those same files.
+YOUR TASK: Given a JIRA issue (a new feature or improvement) and its associated code
+changes, determine whether the SonarQube technical debt that was fixed during this
+commit is **causally related** to resolving the JIRA issue — or whether it is
+**incidental cleanup** that happened to be committed alongside the feature work.
+
+CAUSAL: The TD fix was a natural or necessary part of implementing the feature —
+e.g., a method was restructured to add new logic and complexity dropped as a side
+effect, or a class was extended and coupling issues in it were resolved in the process.
+
+INCIDENTAL: The TD fix has no logical connection to the feature — e.g., a missing
+Javadoc was added in a completely unrelated utility class, or a naming violation was
+corrected in a file the feature never needed to touch.
+
+NOTE: RefactoringMiner detections are provided as supporting context to help you
+understand the structural shape of the changes. SonarQube evidence is your primary
+signal for the verdict.
 
 ═══════════════════════════════════════════════
 JIRA {jira_id}  |  Type: {issue_type}
@@ -409,43 +462,52 @@ Title: {title}
 Description: {description}
 ═══════════════════════════════════════════════
 
-REFACTORINGMINER DETECTIONS (classified):
-{ref_section}
-
-SONARQUBE DELTA:
-  Baseline TD count : {baseline_count}  (NOT shown — too large)
+SONARQUBE DELTA  ← primary signal:
+  Baseline TD count : {baseline_count}
   Fixed issues      : {fixed_count}
 {fixed_lines}
   New issues added  : {new_count}
 {new_lines}
 
-PRODUCTION CODE DIFF (sha_before → sha_after, test files excluded):
+REFACTORINGMINER DETECTIONS (supporting context only):
+{ref_section}
+
+FULL CODE DIFF (sha_before → sha_after, production + test files):
 {diff_section}
 
 ═══════════════════════════════════════════════
-REASONING STEPS (work through these before deciding):
+REASONING STEPS — work through all five before deciding:
 
-1. INTENT — Does the JIRA title/description signal a structural simplification
-   designed to enable future work, or is it pure cleanup/bugfix with no forward intent?
+1. FEATURE SCOPE — From the JIRA title, description, and diff, identify which files
+   and methods are the core locus of the feature work. Be specific (e.g., "the feature
+   primarily touched TaskManager.java and its callsites").
 
-2. REFACTORING SIGNAL — Are the detected refactoring types STRUCTURAL (e.g., Extract
-   Method, Move Class) which restructure for extensibility, or COSMETIC (e.g., Extract
-   Variable, Rename) which are low-value for prefactoring claims?
+2. SONARQUBE SPATIAL OVERLAP — For each fixed SonarQube issue, check whether it is
+   in a file/method that falls inside the feature scope identified in Step 1. Issues
+   fixed inside the feature scope are candidates for causal relation; issues fixed
+   outside it are strong candidates for incidental cleanup.
 
-3. SONARQUBE SIGNAL — Are the fixed issues STRUCTURAL (Cognitive Complexity, Coupling,
-   Method Length) hinting at preparatory simplification, or COSMETIC (unused field,
-   missing Javadoc, naming) suggesting incidental cleanup?
+3. SONARQUBE ISSUE NATURE — For the fixed issues that ARE inside the feature scope,
+   assess whether the fix is plausibly a byproduct of the feature work: e.g., cognitive
+   complexity dropped because a large method was split to add new behavior; a coupling
+   issue resolved because a dependency was restructured to wire in a new component.
+   Distinguish this from fixes that look deliberate and unrelated (e.g., added Javadoc
+   in a file only superficially touched, removed unused field in a class that was merely
+   imported).
 
-4. SPATIAL OVERLAP — Are the refactorings and TD fixes happening in the **same files**
-   that the feature change primarily touched? (If yes, stronger prefactoring signal.)
+4. TEST COVERAGE SIGNAL — Do the test file changes cover the same logic where TD was
+   fixed? New or modified tests targeting the refactored/fixed code strengthen the
+   causal link; absent tests or tests in unrelated areas weaken it.
 
-5. TIMING — Do the commits mix refactoring + feature work in the same change, or are
-   they clearly separated? Mixed = stronger prefactoring signal.
+5. PROPORTION JUDGEMENT — What fraction of the total fixed TD is causally related
+   vs. incidental? If the majority of fixed issues are incidental, the overall verdict
+   is incidental even if some fixes are causal. If most are causal, the verdict is
+   causal. Use this to calibrate confidence.
 
-Based on the above evidence, conclude.
+Based on the evidence above, conclude.
 
 RESPOND WITH VALID JSON ONLY — no markdown fences, no prose outside the JSON:
-{{"prefactoring_detected": true/false, "confidence": "high/medium/low", "structural_refactoring": true/false, "structural_td_fixed": true/false, "reasoning": "2-3 sentences citing specific evidence from the diff/sonar/commits above"}}"""
+{{"prefactoring_detected": true/false, "confidence": "high/medium/low", "spatial_overlap": true/false, "causal_byproduct": true/false, "incidental_count": <int>, "causal_count": <int>, "structural_refactoring": true/false, "structural_td_fixed": true/false, "reasoning": "2-3 sentences citing specific SonarQube issues, file names, and diff evidence"}}"""
 
 
 # ---------------------------------------------------------------------------
@@ -453,29 +515,37 @@ RESPOND WITH VALID JSON ONLY — no markdown fences, no prose outside the JSON:
 # ---------------------------------------------------------------------------
 
 def select_prompt_diff_files(issue: dict, diff_data: Optional[dict]) -> list:
-    """Select production Java diff files to include in the Claude prompt."""
+    """Select diff files to include in the Claude prompt.
+
+    Previously this returned only production Java files (excluding tests).
+    Change: prefer the issue's IMPACTED_FILES list if present, otherwise
+    include all files from the GitHub compare result (tests and non-Java
+    files included).
+    """
+    if not diff_data or "files" not in diff_data:
+        return []
+
+    # Build set of impacted basenames (if provided by the issue metadata)
     impacted_basenames = {
         Path(f["PARENT_PATH"]).name
         for f in issue.get("IMPACTED_FILES", [])
         if f.get("PARENT_PATH")
     }
 
-    if not diff_data or "files" not in diff_data:
-        return []
+    files = diff_data["files"]
 
-    prod_files = [
-        f for f in diff_data["files"]
-        if is_production_java(f.get("filename", ""))
-        and Path(f.get("filename", "")).name in impacted_basenames
-    ]
+    # If the issue provides IMPACTED_FILES, prefer returning only those Java files
+    if impacted_basenames:
+        impacted_files = [
+            f for f in files
+            if is_java(f.get("filename", ""))
+            and Path(f.get("filename", "")).name in impacted_basenames
+        ]
+        if impacted_files:
+            return impacted_files
 
-    if prod_files:
-        return prod_files
-
-    return [
-        f for f in diff_data["files"]
-        if is_production_java(f.get("filename", ""))
-    ]
+    # Fallback: return only Java files from the full diff (includes test files)
+    return [f for f in files if is_java(f.get("filename", ""))]
 
 
 def build_prompt_for_issue(
@@ -487,24 +557,57 @@ def build_prompt_for_issue(
 
 
 def parse_model_verdict(raw: str) -> dict:
+    """
+    Extract and parse the JSON verdict from a Claude response.
+
+    Strategies tried in order:
+
+      1. Direct parse — model returned a complete bare JSON object (ideal).
+
+      2. Fence extraction — JSON wrapped in a markdown code fence anywhere in
+         the text (with or without a language tag, with or without prose around it):
+             ```json
+             {"prefactoring_detected": true, ...}
+             ```
+
+      3. Greedy extraction — first {...} blob found anywhere in the response.
+         Handles prose-before-JSON without a fence:
+             After analysis: {"prefactoring_detected": true, ...}
+    """
+    import re
+
     raw = raw.strip()
 
-    # Strip accidental markdown fences if the model misbehaves
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
+    # Strategy 1 — direct parse (complete JSON object, no wrapper)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        log.warning("    Could not parse JSON from model response: %s", raw[:200])
-        return {
-            "prefactoring_detected": None,
-            "confidence": "error",
-            "reasoning": f"JSON parse error. Raw: {raw[:300]}",
-        }
+        pass
+
+    # Strategy 2 — extract from a markdown code fence anywhere in the response.
+    # Handles optional language tag (```json or just ```) and leading/trailing prose.
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3 — greedy extraction of the first {...} block in the text.
+    # Covers "prose before the object" without a code fence.
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    log.warning("    Could not parse JSON from model response: %s", raw[:200])
+    return {
+        "prefactoring_detected": None,
+        "confidence": "error",
+        "reasoning": f"JSON parse error. Raw: {raw[:300]}",
+    }
 
 
 def enrich_verdict(
@@ -516,6 +619,24 @@ def enrich_verdict(
     api_mode: str,
     usage: Optional[Any] = None,
 ) -> dict:
+    # Normalize and enrich model output with local metadata expected by downstream tools
+    # Ensure the model-provided key `prefactoring_detected` exists; fall back to older key names.
+    if "prefactoring_detected" not in verdict and "td_related_to_issue" in verdict:
+        verdict["prefactoring_detected"] = verdict.pop("td_related_to_issue")
+
+    # Structural signals may be provided by the model; if missing, default to False
+    verdict.setdefault("structural_refactoring", False)
+    verdict.setdefault("structural_td_fixed", False)
+
+    # Other keys the analyzer expects — provide safe defaults to avoid KeyErrors
+    verdict.setdefault("prefactoring_detected", None)
+    verdict.setdefault("confidence", "unknown")
+    verdict.setdefault("spatial_overlap", False)
+    verdict.setdefault("causal_byproduct", False)
+    verdict.setdefault("incidental_count", 0)
+    verdict.setdefault("causal_count", 0)
+    verdict.setdefault("reasoning", "")
+
     verdict["jira_id"]           = issue["jira_id"]
     verdict["issue_type"]        = issue.get("issue_type", "")
     verdict["refactoring_count"] = issue.get("refactoring_count", 0)
@@ -545,9 +666,11 @@ def analyze_issue(
     """
     prompt = build_prompt_for_issue(issue, report, diff_data)
 
+    # SYSTEM_PROMPT enforces JSON-only output at the API level.
     response = client.messages.create(
         model=model,
         max_tokens=MAX_CLAUDE_OUTPUT_TOKENS,
+        system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -865,6 +988,7 @@ def run_pipeline(
                 "params": {
                     "model": model,
                     "max_tokens": MAX_CLAUDE_OUTPUT_TOKENS,
+                    "system": SYSTEM_PROMPT,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             })
@@ -970,12 +1094,18 @@ def run_dry_run(
 ) -> None:
     log.info("DRY RUN - counting eligible issues and estimating Anthropic cost.")
     
+    # Try to get API key from parameter, then environment
+    if not anthropic_key or not anthropic_key.strip():
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    else:
+        anthropic_key = anthropic_key.strip()
+    
     if not anthropic_key:
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not anthropic_key:
-        log.error("ANTHROPIC_API_KEY not set. Cannot estimate tokens.")
+        log.error("ANTHROPIC_API_KEY environment variable not set or empty.")
+        log.error("Please set it with: export ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
     
+    log.debug("ANTHROPIC_API_KEY found: %s...", anthropic_key[:20])
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     all_issues = load_json(issues_file)
@@ -1148,11 +1278,19 @@ Environment variables:
     args = parser.parse_args()
     args.model = normalize_model(args.model)
 
-    github_token  = os.environ.get("GITHUB_TOKEN", "")
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    # Show diagnostics if dry-run is requested (helps debug missing env vars)
+    if args.dry_run:
+        diagnose_environment()
+
+    github_token  = os.environ.get("GITHUB_TOKEN", "").strip()
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+    log.debug("Environment check: ANTHROPIC_API_KEY=%s", 
+              "found" if anthropic_key else "NOT FOUND")
 
     if not anthropic_key and not args.dry_run:
-        log.error("ANTHROPIC_API_KEY not set.")
+        log.error("ANTHROPIC_API_KEY environment variable not set or empty.")
+        log.error("Please set it with: export ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
 
     if args.model not in MODEL_PRICING:

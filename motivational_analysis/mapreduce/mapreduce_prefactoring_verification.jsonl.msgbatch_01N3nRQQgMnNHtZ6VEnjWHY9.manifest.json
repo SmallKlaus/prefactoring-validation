@@ -1,0 +1,11 @@
+{
+  "batch_id": "msgbatch_01N3nRQQgMnNHtZ6VEnjWHY9",
+  "model": "claude-sonnet-4-6",
+  "output_file": "motivational_analysis\\mapreduce\\mapreduce_prefactoring_verification.jsonl",
+  "custom_id_to_jira_id": {
+    "MAPREDUCE-7237": "MAPREDUCE-7237",
+    "MAPREDUCE-5608": "MAPREDUCE-5608",
+    "MAPREDUCE-7503": "MAPREDUCE-7503"
+  },
+  "created_at_unix": 1778790009
+}
